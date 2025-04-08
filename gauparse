@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+__version__="1.7.0"
+import re
+import sys,os,shutil
+from argparse import ArgumentParser
+import mmap
+from bisect import bisect
+
+def get_options():
+  argparser = ArgumentParser(description='parser for gaussian log file')
+  argparser.add_argument('gaussian_log_file')
+  argparser.add_argument('-l', '--last',action="store_true",
+                         help='create restart input with last structure')
+  argparser.add_argument('-m', '--minimal',action="store_true",
+                         help='create restart input with minimal energy structure')
+  argparser.add_argument('-r', '--restart',action="store_true",
+                         help='create restart input with minimal energy structure')
+  argparser.add_argument('-s', '--stat',action="store_true",
+                         help='create input with Stationary structures')
+  argparser.add_argument('-x', '--xyz',action="store_true",
+                         help='create xyz file rather than input')
+  argparser.add_argument('-a', '--allorients',action="store_true",
+                         help='create input/xyz file for all orients during optimization')
+  argparser.add_argument('-v', '--version', action='version',version=__version__)
+  return argparser.parse_args()
+
+
+class GauTracer():
+  '''parser class for Gaussian 16 Rev. C01 log file'''
+  atom_symbol = (
+  'Bq','H ','He','Li','Be','B ','C ','N ','O ','F ','Ne',
+       'Na','Mg','Al','Si','P ','S ','Cl','Ar','K ','Ca',
+       'Sc','Ti','V ','Cr','Mn','Fe','Co','Ni','Cu','Zn',
+       'Ga','Ge','As','Se','Br','Kr','Rb','Sr','Y ','Zr',
+       'Nb','Mo','Tc','Ru','Rh','Pd','Ag','Cd','In','Sn',
+       'Sb','Te','I ','Xe','Cs','Ba','La','Ce','Pr','Nd',
+       'Pm','Sm','Eu','Gd','Tb','Dy','Ho','Er','Tm','Yb',
+       'Lu','Hf','Ta','W ','Re','Os','Ir','Pt','Au','Hg',
+       'Tl','Pb','Bi','Po','At','Rn','Fr','Ra','Ac','Th',
+       'Pa','U ','Np','Pu','Am','Cm','Bk','Cf','Es','Fm',
+       'Md','No','Lr','Rf','Db','Sg','Bh','Hs','Mt','Ds',
+       'Rg','Cn','Nh','Fl','Mc','Lv','Ts','Og','Uue','Ubn'
+  )
+  def __init__(self,**kwargs):
+    for k,v in kwargs.items():
+        setattr(self,k,v)
+    self.orients=[]
+  
+  @staticmethod
+  def _pattern_to_energy(p): 
+    return float(p.group(1).replace(b"D",b"E"))
+
+  def parse(self):
+    '''parse log file to get energy, force, and geometry'''
+    logf=self.gaussian_log_file
+    if not os.path.exists(logf): sys.exit(f"log file '{logf}' not found")
+    # memory-map the log file
+    with open(logf,"r") as f: mm=mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    # detect calc level from head section
+    head_search=re.search(rb"------ *\n *#(.*\n){,30} *-------",mm)
+    head=head_search.group().replace(b"\n ",b"").lower() if head_search else b""
+    head=head.replace(b"# ",b"#").replace(b"#",b"# ") # ensure space
+    is_xqc=True if re.search(rb"scf[(=]+[\w ,]*[xy]qc\W",head) else False
+    # define regex pattern for each level
+    level_key=(("oniom"   ,r"ONIOM: extrapolated energy = *"),
+               ("eomccsd" ,r" E\(EOM-CCSD\) = *"),
+               ("sac-ci"  ,r" Total energy= *"),
+               ("ccsd(t)" ,r" CCSD\(T\)= *"),
+               ("ccsd"    ,r"amplitudes converged. E\(Corr\)= *"),
+               ("b2plyp"  ,r"[0-9] E\(B2PLYP\) = *"),
+               ("mp2"     ,r" EUMP2 = *"),
+               ("casscf"  ,r"\n TOTAL +"),
+               ("external",r"\n Energy= +"),
+               (" td"     ,r" E\(TD-HF/TD-(?:DFT|KS)\) = *"),
+               (" tda"    ,r" E\(CIS/TDA\) = *"),
+               ("amber"   ,r"\n Energy= +"),
+               (" uff"    ,r"\n Energy= +"),
+               ("dreiding",r"\n Energy= +"))
+    otherm=("SCF",rb"SCF Done: +E\(.*\) *= *")
+    #level,key=next(((m,k) for m,k in level_key if m.encode() in head),otherm)
+    level,key=next(((m,k.encode()) for m,k in level_key 
+        if re.search(re.escape(m).encode()+rb"\W",head)),otherm)
+    self.level=level
+    modred=True if b"modred" in head  else False
+    # regex patterns
+    patF=re.compile(rb"\n +Item .*\n( *(?:Maximum|RMS).*\n){4,6}") # force
+    patE=re.compile(key+rb"([-0-9.+DEe]+)")  # energy
+    if is_xqc and level == "SCF": patE=re.compile(key+rb"([-0-9.+DEe]+) +A.U.")
+    patSt=re.compile(rb"Stationary point found") # stationary
+    patSc=re.compile(rb" ([ARD]\([\d,]+\)) +-*\d*\.\d+ +Scan +!") # scan parameter
+    patN=re.compile(rb"Normal termination")
+    
+    orient_typ=b" +Input " if b"printinput" in head else b" +(?:Standard|Input) "
+
+    # orientation
+    patO=re.compile(orient_typ+rb"orientation: +\n -{3,} *\n(?: .*\n){2,3} -{3,} *\n((?: +[0-9 +-.]+\n){1,}) -{3,}") 
+
+    # get energies
+    try:
+      ens=[(self._pattern_to_energy(p), p.start()) for p in patE.finditer(mm)]
+    except:
+      sys.exit(f"fail to read energy as float from '{logf}'") 
+    if len(ens) == 0: sys.exit(f"energy not found in '{logf}', level={level}")
+    E,posE=zip(*ens) # energies and their positional indices
+    # indices of E for stationary points
+    iStat=[bisect(posE,p.start())-1 for p in patSt.finditer(mm)]
+    fsize=len(mm)
+    self.minE=min(E) # minimum energy
+    iminE=E.index(self.minE)
+    #iminE=len(E)-1-E[::-1].index(self.minE)
+    posminE=posE[iminE]
+    pnext=posE[iminE+1] if len(posE)>iminE+1 else fsize
+    pprev=posE[iminE-1] if 0<iminE else 0
+    # scanned coordinate
+    scanc=[re.escape(p.group(1)) for p in patSc.finditer(mm,0,posE[0])] if modred else []
+    if scanc:
+      # scanned value 
+      patP=re.compile(rb" (?:"+rb"|".join(scanc)+rb") +(-*\d*\.\d+) +.DE.DX *= *(-*\d*\.\d+).*?\n")
+      if self.stat:
+        scanp=[(p.group(1),p.group(2),bisect(posE,p.start())-1) for p in patP.finditer(mm,posE[0])]
+      else: scanp=[(p.group(),"",bisect(posE,p.start())-1) for p in patP.finditer(mm,posE[0])]
+    else: scanp=[]
+    self.E=E
+    self.iminE=iminE
+    self.iStat=iStat
+    self.scanp=scanp
+    self.scanc=scanc
+    self.label="M"
+    if self.allorients: self.label="A"
+    elif self.last: self.label="L"
+    elif self.stat and (scanc or len(iStat)>1): self.label="S"
+    # check normal termination
+    if patN.search(mm[-100:]):
+      self.label+="ntd"
+    else:
+      # upper limit is 999
+      self.label+=str(len(ens)).zfill(3) if len(ens) <= 999 else "999"
+    # read force
+    if not self.stat:
+      self.frs=[p.group().decode('utf-8') for p in patF.finditer(mm,posminE,pnext)]
+      if not self.frs: self.frs=[p.group().decode('utf-8') for p in patF.finditer(mm,posminE)]
+    # read geometry
+    if(self.restart or self.stat):
+      if self.allorients:
+        _posE0=[0]+list(posE)
+        pos_list=[(_posE0[i],_posE0[i+1]) for i in range(len(posE))]
+      elif self.stat and (scanc or len(iStat)>1):
+        pos_list=[]
+        for idx in iStat:
+          pprev=posE[idx-1] if idx>0 else 0
+          pos_list.append((pprev,posE[idx]))
+      else:
+        endpos=posminE
+        if self.last: 
+          endpos=posE[-1] if len(posE) > 1 else fsize 
+          if len(posE)>1: pprev=posE[-2]
+        pos_list=[(pprev,endpos)]
+      for pos,endpos in pos_list:
+        geoms=[p.group(1) for p in patO.finditer(mm,pos,endpos)]
+        if not geoms and not self.allorients: geoms=[p.group(1) for p in patO.finditer(mm,posE[0],posminE)]
+        # get the last matched
+        xyz_area=[x for x in geoms[-1].decode('utf-8').splitlines()] if geoms else []
+        if xyz_area: self.orients.append(xyz_area)
+    mm.close()
+    return
+
+  def summary(self,count=True,columns=80):
+    '''print summary of parsing'''
+    if not hasattr(self,"E"):return
+    if count:
+      _mcolumns = float(columns-4) if columns > 4 else float(columns)
+      block=(max(self.E)-self.minE)/_mcolumns
+      cnts=[format(i+1,"03d")+"|" for i in range(len(self.E))]
+    else:
+      cnts=[""]*len(self.E)
+      block=(max(self.E)-self.minE)/float(columns)
+    if not self.stat and block>0:
+      print(f"#={block:15.10f}({block*627.5095:9.4f} kcal/mol), level={self.level}")
+      for idx,e in enumerate(self.E):#enumerate(zip(self.E,self.posE)):
+        mblock=int((e-self.minE)/block)
+        blocks=("#"*max(mblock,0)).replace("#"*10,"#"*9+"\033[31m#\033[0m")
+        print(cnts[idx]+blocks,end="")
+        if idx == self.iminE: 
+          print(f"\033[31m Emin = {self.minE}",end="\033[0m")
+          if self.frs: print("\033[31m"+self.frs[0].rstrip(),end="\033[0m")
+        elif mblock ==0: print(f": {e-self.minE:15.10f}",end="")
+        print('')
+        if idx in self.iStat: 
+          print("Stationary point",end="")
+          if idx == self.iminE: print(" with lowest energy")
+          else : print(f": dE={(e-self.minE)*627.5095:10.4f} kcal/mol")
+          scan_param=[sc.decode('utf-8') for sc,grad,iscan in self.scanp if idx == iscan]
+          if scan_param: print("\033[31m",*scan_param,"\033[0m",sep="")
+      if len(self.E)>1 and not idx in self.iStat:
+        print(f"Last (non-Stationary) point: dE= {(e-self.minE)*627.5095:9.4f} kcal/mol")
+    elif len(self.E)==1:
+      print(f"energy found only once, level={self.level}")
+      print(*self.E)
+      return
+    else:
+      print(f"level={self.level}, scanned_param: "+b",".join(self.scanc).decode('utf-8').replace("\\",""))
+      for i,idx in enumerate(self.iStat):
+        scan_param=[(sc.decode('utf-8'),grad.decode('utf-8')) for sc,grad,iscan in self.scanp if iscan == idx] if self.scanc else [("","")]
+        scs,grads=zip(*scan_param)
+        print(format(self.E[idx],".8f"),*scs,*grads,sep=",")
+    return
+
+  def create_inp(self):
+    '''create g16 input file to restart calculation with obtained structure'''
+    orients=self.orients
+    if not orients: 
+      print("optimization not detected and restart file not created")
+      return
+    if self.allorients and (len(self.E) != len(orients)):
+      print("warning: length of Energies and orients mismatched")
+    logf=self.gaussian_log_file
+    patA=re.compile(r'^ *[a-zA-Z]+ *$')
+    #patX=re.compile(r'[ \t][\d\- ]{1,4}\.\d*(?:[\t ]+-?\d+\.\d*){2}')
+    patC=re.compile(r'(^\s*[^()\s,]+(?:\([^()]+\))?(?:[\s,]+[\d-]{1,2}(?=[\s,]))?)(?:[\s,]+-?\d+\.\d*){3}(.*)')
+    ifn=os.path.splitext(logf)[0]
+    extension,inpf="gjf",None
+    # try to use corresponding input file as template
+    for e in ["gjf","com"]:
+      if os.path.exists(ifn+"."+e): extension,inpf=e,ifn+"."+e
+    head=[]
+    cart=[]
+    tail=[]
+    if inpf:
+      with open(inpf) as f: 
+        cnt=0
+        for l in f.read().splitlines():
+          if not l.split(): cnt+=1
+          elif '--Link1--' in l: break
+          if cnt<=3:
+            head.append(l)
+            if cnt>=2: 
+              cnt+=1
+          elif cnt==4:
+            m_=patC.match(l)
+            if not m_: break
+            cart.append(m_)
+          elif cnt>=5: 
+            tail.append(l)
+    else:
+      # template not found, dummy is used
+      head=["# b3lyp/6-31g(d)",
+            "",
+            "no_input",
+            "",
+            "0 1"]
+    if not tail: tail=[""]
+    if self.xyz: extension="xyz"
+    restart_input=ifn+"."+self.label+"."+extension
+    out=[]
+    for j, xyz_area in enumerate(orients):
+      newcrd=[]
+      if out and not self.xyz: out.append("--Link1--")
+      if self.xyz or not cart:
+        def _get_crd(x): return " ".join([self.atom_symbol[int(x[0])], re.sub('^([0-9])',r' \1',x[1])])
+        newcrd=[ _get_crd(l.split(sep=None,maxsplit=3)[1::2])  for l in xyz_area]
+      elif len(cart)==len(xyz_area):
+        #newcrd=[patX.sub(xyz_area[i][30:],car,count=1) for i,car in enumerate(cart)]
+        maxlen=max(map(len,[m.group(1) for m in cart]))
+        # format in CorPrS
+        newcrd=[m.group(1).ljust(maxlen)+x[33:]+m.group(2) for m,x in zip(cart,xyz_area)]
+      else:
+        raise Exception(f"# of atoms in log and input files not matched, {len(xyz_area)} and {len(cart)}")
+      if self.xyz:
+        out.extend([len(newcrd),f"{j+1}.xyz"]+newcrd)
+      else:
+        out.extend((*head,*newcrd,*tail))
+    with open(restart_input,"w") as f:
+      print(*out,sep="\n",file=f)
+      print("orientation was saved in",restart_input)
+    
+if __name__=="__main__":
+  # get terminal size
+  columns,_  = shutil.get_terminal_size()
+  # get options 
+  args=get_options()
+  if (args.minimal or args.stat or args.last or
+          args.xyz or args.allorients): args.restart=True
+  # file parse
+  gat=GauTracer(**vars(args))
+  gat.parse()
+  # print summary
+  gat.summary(columns=columns)
+  if args.restart: 
+    gat.create_inp()
+  if args.allorients:
+    print(*gat.E,sep="\n")
